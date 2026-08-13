@@ -32,9 +32,45 @@ The `PUT` payload accepts two fields:
 
 ### 2. Skills — repository- and workspace-scoped instruction packs
 
-Skills are structured, reusable instruction sets that live in the workspace filesystem and are auto-discovered by the agent when a chat attaches to a workspace. They are the right home for domain playbooks — `deep-review`, `release-checklist`, `payments-domain-conventions`, and similar.
+Skills are structured, reusable instruction sets that live in the workspace filesystem and are auto-discovered by the workspace agent. They are the right home for domain playbooks — `deep-review`, `release-checklist`, `payments-domain-conventions`, and similar.
 
-Layout: place skill directories under `.agents/skills/` relative to the workspace working directory. Each directory contains a required `SKILL.md` file plus any supporting files the skill needs.
+#### Where the agent looks for skills
+
+The workspace agent runs a resolver that scans a set of **scan roots** and looks for skills only in a fixed set of container subdirectories under each root.
+
+**Built-in scan roots (evaluated on every resolve):**
+
+- The workspace agent's **working directory** (whatever it resolves to for that workspace — e.g. `~/hz` if your repo is cloned there and the agent runs from it).
+- `~/.coder`
+- `~/.coder/skills`
+- `~/.claude/plugins/cache`
+
+**Fixed skill container subdirectories under each scan root:**
+
+- `skills/`
+- `.agents/skills/`
+- `.claude/skills/`
+- `.codex/skills/`
+
+Discovery is **shallow**: a skill is an immediate subdirectory of one of those containers that holds a `SKILL.md`. The resolver does not walk the tree.
+
+Concretely, if your repo is cloned to `~/hz` and the agent's working directory is `~/hz`, the natural home for a skill is:
+
+```
+~/hz/.agents/skills/<skill-name>/SKILL.md
+```
+
+Checked into the repo, no symlinks needed. Alternatively, `~/.coder/skills/<skill-name>/SKILL.md` also works out of the box because `~/.coder/skills` is a built-in scan root. Note that `~/.agents/skills` (under the home directory) is **not** a built-in scan root; symlinking to that path will not make skills discoverable.
+
+**To register an extra scan root** (for example, a repo cloned outside the working directory), run this from inside the workspace:
+
+```sh
+coder chat context add <absolute-path>
+```
+
+The agent then treats that path as an additional scan root, applying the same discovery rules — instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`), `.agents/skills/<name>/SKILL.md`, and `.mcp.json` — and picks up changes live. Related commands: `coder chat context list`, `show <path>`, `remove <path>`, `refresh`.
+
+#### Directory structure
 
 ```
 .agents/skills/
@@ -49,7 +85,7 @@ Layout: place skill directories under `.agents/skills/` relative to the workspac
     └── SKILL.md
 ```
 
-`SKILL.md` starts with YAML frontmatter and a markdown body:
+#### `SKILL.md` format
 
 ```md
 ---
@@ -62,14 +98,48 @@ description: "Multi-reviewer code review with domain-specific reviewers"
 Instructions for the skill go here...
 ```
 
-Mechanics worth knowing:
+#### How and when skills appear in a chat
 
-- **Lazy loading.** On the first turn of a workspace-attached chat, the agent scans `.agents/skills/` and builds an `<available-skills>` block in its system prompt listing each skill's name and description. Only frontmatter is read during discovery. The full skill content is loaded on demand when the agent calls the `read_skill` tool. You can ship many skills without inflating context.
-- **Two tools are registered when skills are present:** `read_skill` (returns the `SKILL.md` body, the absolute skill directory for workspace skills, and a list of supporting files) and `read_skill_file` (returns the content of a supporting file, with path-safe resolution).
-- **Naming and size constraints:** names must be kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`) and match the directory name exactly. `SKILL.md` has a maximum size of 64 KB. Supporting files have a maximum of 512 KB; files exceeding that limit are silently truncated.
-- **Path safety.** `read_skill_file` rejects absolute paths, paths containing `..`, and references to hidden files. All paths are resolved relative to the skill directory.
+The workspace agent continuously resolves skills as they appear on disk; a file watcher re-resolves on change with a debounce. What the agent maintains is an **index** of discovered skills — just their frontmatter (name, description). This index is what gets injected into a chat.
 
-**Personal Skills** are the user-scoped counterpart, managed under **Agents → Settings → Personal Skills**. They use the same `SKILL.md` format, are portable to and from workspace skills, and are subject to two extra limits: **supporting files are not supported** (single `SKILL.md` file only), each `SKILL.md` is up to 64 KB, and each user can create up to 100 personal skills. Use these for individual preferences that shouldn't live in a shared repository.
+The precise sequence when you start a chat:
+
+1. **Workspace starts** → the agent resolver scans the scan roots → the skill index is ready.
+2. **You attach a chat to the workspace.**
+3. **On the first turn of that chat**, an `<available-skills>` block listing each discovered skill's name and description is included in the system prompt. Only frontmatter appears there.
+4. **On demand**, when the model decides a skill is relevant, it calls the `read_skill` tool to load the full `SKILL.md` body. Supporting files are fetched via `read_skill_file`. That is the "lazy" part — full skill contents don't live in the system prompt.
+
+Two tools are registered when skills are present:
+
+- **`read_skill`** — returns the `SKILL.md` body, the absolute skill directory (for workspace skills), and a list of supporting files.
+- **`read_skill_file`** — returns the content of a supporting file, with path-safe resolution.
+
+For workspace skills, `read_skill` also returns `dir`, the absolute path to the skill directory in the workspace. The agent's `read_file` and `execute` tools operate on that same workspace filesystem, so you can join `dir` with a supporting file's relative path to read or run that file directly — for example, to execute a bundled `scripts/` helper. `read_skill_file` remains available as a path-safe convenience for reading supporting files.
+
+#### Naming, size, and path-safety constraints
+
+- **Names** must be kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`) and match the directory name exactly.
+- **`SKILL.md`** has a maximum size of 64 KB.
+- **Supporting files** have a maximum of 512 KB; files exceeding the limit are silently truncated.
+- **Path safety**: `read_skill_file` rejects absolute paths, paths containing `..`, and references to hidden files. All paths are resolved relative to the skill directory.
+
+#### Multiple workspaces
+
+A chat is attached to one workspace at a time. That workspace's agent supplies the skill index. If you want a chat to see skills that live in a different workspace, bring them into the attached workspace — either by cloning the repository there, by symlinking a directory into a scan root, or by registering the path as an extra scan root via `coder chat context add`.
+
+#### Mid-chat changes and refresh
+
+If you attach a workspace, add a new skill, or change scan roots *during* an ongoing chat, the chat's system prompt does not retroactively update. Run `coder chat context refresh` from inside the workspace to dirty the chat and pick up the agent's latest snapshot on the next turn.
+
+#### Personal Skills
+
+Personal Skills are the user-scoped counterpart, managed under **Agents → Settings → Personal Skills**. They use the same `SKILL.md` format and are portable to and from workspace skills, subject to a few extra limits:
+
+- **Supporting files are not supported** (single `SKILL.md` file only).
+- Each `SKILL.md` is up to 64 KB.
+- Each user can create up to 100 personal skills.
+
+Use these for individual preferences that shouldn't live in a shared repository.
 
 ### 3. Admin-registered MCP servers — deployment-wide knowledge systems
 
@@ -96,7 +166,7 @@ Only enabled servers are visible to non-admins, and sensitive fields such as API
 
 ### 4. Workspace-scoped MCP (`.mcp.json`) — per-repo, per-template tools
 
-For MCP servers that are specific to a repository or template (for example, a schema explorer for a particular service, or a repo-local internal API docs server), drop a `.mcp.json` at the workspace working directory root:
+For MCP servers that are specific to a repository or template (for example, a schema explorer for a particular service, or a repo-local internal API docs server), drop a `.mcp.json` at the workspace working directory root (or at any registered scan root):
 
 ```json
 {
@@ -122,14 +192,14 @@ For MCP servers that are specific to a repository or template (for example, a sc
 
 ## Two related surfaces worth mentioning
 
-**`AGENTS.md`.** Create an `AGENTS.md` file in the workspace agent's working directory (or `~/.coder/AGENTS.md`). It is automatically read and included in the system prompt for every conversation with a Coder Agent that uses that workspace. Good for repository-specific build and test instructions, architectural constraints, and links to runbooks.
+**`AGENTS.md`.** Create an `AGENTS.md` file in the workspace agent's working directory (or `~/.coder/AGENTS.md`). It is automatically read and included in the system prompt for every conversation with a Coder Agent that uses that workspace. Good for repository-specific build and test instructions, architectural constraints, and links to runbooks. The resolver also recognizes `CLAUDE.md` and `.cursorrules` at the top of any scan root.
 
 **Template routing.** When the agent needs a workspace, it selects a template by reading the template's name, short description (limited to under 128 characters, sorted by active developer count), and a bounded README excerpt (roughly the first 1,000 characters in the listing view, up to roughly 8,000 characters in the detail view). The excerpt is reduced to plain text: frontmatter is stripped, link text is kept while URLs are dropped, images and badges are dropped entirely, and code blocks and tables are preserved as text. The agent does not read Terraform. Clear, specific template descriptions are the strongest routing signal you can give the agent. Admins can also restrict which templates the agent may use at **Agents → Settings → Manage Agents → Templates** without affecting manual workspace creation.
 
 ## A recommended composition
 
 - **Layer 1 (system prompt):** company identity, standards, approved-SaaS list, template routing hints, escalation paths.
-- **Layer 2 (`.agents/skills/`):** commit domain playbooks alongside code. Lazy loading means scaling to many skills is cheap.
+- **Layer 2 (`.agents/skills/`):** commit domain playbooks alongside code, under `<repo>/.agents/skills/<name>/SKILL.md`. Lazy loading means scaling to many skills is cheap.
 - **Layer 3 (admin MCP servers):** connect the knowledge systems you already run. Use `default_on` for broadly useful org-wide knowledge, `force_on` for security/compliance tooling, `default_off` for niche integrations.
 - **Layer 4 (workspace `.mcp.json`):** repo- or template-specific tools that don't make sense deployment-wide.
 - **Personal Skills:** individual engineer preferences, without polluting shared repositories.
